@@ -65,6 +65,108 @@ object StreamSink {
     Stream(payloadType).freeRun()
 }
 
+///** Used to merge the streams from StreamDemux,
+//  * So there must be no more than one stream to be valid at the sanme time.
+//  */
+//class MergeDemuxStreams[T <: Data](dataType: HardType[T], val portCount: Int)
+//    extends Component {
+//  val io = new Bundle {
+//    val inputs = Vec(slave(Stream(dataType)), portCount)
+//    val output = master(Stream(dataType))
+//  }
+//
+//  val validOH = io.inputs.map(_.valid).asBits()
+//  assert(
+//    assertion = CountOne(validOH) <= 1,
+//    message =
+//      L"merge streams having more than one valid, streams to merge should be demux-ed from the same original one",
+//    severity = ERROR
+//  )
+//  for ((inputStream, idx) <- io.inputs.zipWithIndex) {
+//    inputStream.ready := validOH(idx)
+//  }
+//  io.output << io.inputs.oneHotAccess(validOH)
+//}
+//
+//object MergeDemuxStreams {
+////  def apply[T <: Data](inputs: Stream[T]*): Stream[T] = {
+////    MergeDemuxStreams(Vec(inputs.toIterable))
+////  }
+//
+//  def apply[T <: Data](inputs: Seq[Stream[T]]): Stream[T] = {
+//    val vec = Vec(inputs)
+//    MergeDemuxStreams(vec)
+//  }
+//
+//  def apply[T <: Data](inputs: Vec[Stream[T]]): Stream[T] = {
+//    val merger = new MergeDemuxStreams(inputs(0).payload, inputs.length)
+//    for ((a, b) <- merger.io.inputs.zip(inputs)) {
+//      a << b
+//    }
+//    // merger.io.inputs.zip(inputs) //).map(case (x, y) => x << y)
+//    merger.io.output
+//  }
+//}
+
+/** Join a stream A of fragments with a stream B,
+  * that B will fire only when the first fragment of A fires.
+  */
+class FragmentStreamJoinStream[T1 <: Data, T2 <: Data](
+    dataType1: HardType[T1],
+    dataType2: HardType[T2]
+) extends Component {
+  val io = new Bundle {
+    val inputFragmentStream = slave(Stream(Fragment(dataType1)))
+    val inputStream = slave(Stream(dataType2))
+    val outputJoinStream = master(
+      Stream(Fragment(TupleBundle2(dataType1, dataType2)))
+    )
+  }
+  val dataType2Reg =
+    RegNextWhen(io.inputStream.payload, cond = io.inputStream.fire)
+
+  val isFragVald = io.inputFragmentStream.valid
+  val isFirstFrag = io.inputFragmentStream.isFirst
+  val isLastFrag = io.inputFragmentStream.isLast
+
+  io.inputStream.ready := isFragVald && isFirstFrag && io.inputFragmentStream.fire
+  when(isFragVald && isFirstFrag) {
+    assert(
+      assertion = io.inputFragmentStream.fire === io.inputStream.fire,
+      message =
+        L"during each first beat, inputFragmentStream and inputStream should fire together",
+      severity = FAILURE
+    )
+  }
+
+  // At the first fragment, inputFragmentStream should continue only when inputStream is valid
+  val continueCond = (isFragVald && isFirstFrag) ? io.inputStream.valid | True
+  io.outputJoinStream << io.inputFragmentStream
+    .continueWhen(continueCond)
+    .translateWith {
+      val rslt = cloneOf(io.outputJoinStream.payload)
+      rslt._1 := io.inputFragmentStream.fragment
+      rslt._2 := (isFragVald && isFirstFrag) ? io.inputStream.payload | dataType2Reg
+      rslt.last := io.inputFragmentStream.isLast
+      rslt
+    }
+}
+
+object FragmentStreamJoinStream {
+  def apply[T1 <: Data, T2 <: Data](
+      inputFragmentStream: Stream[Fragment[T1]],
+      inputStream: Stream[T2]
+  ): Stream[Fragment[TupleBundle2[T1, T2]]] = {
+    val join = new FragmentStreamJoinStream(
+      inputFragmentStream.fragmentType,
+      inputStream.payloadType
+    )
+    join.io.inputFragmentStream << inputFragmentStream
+    join.io.inputStream << inputStream
+    join.io.outputJoinStream
+  }
+}
+
 /** Segment the inputStream into multiple pieces,
   * Each piece is at most segmentLenBytes long, and segmentLenBytes cannot be zero.
   * Each piece is indicated by fragment last.
@@ -119,20 +221,29 @@ object StreamSegment {
   * Assume the header width is 4, the valid header Mty can only be 4'b0000, 4'b0001, 4'b0011,
   * 4'b0111, 4'b1111.
   * The output stream does not make any change to the header.
+  *
+  * Each header is for a packet, from first fragment to last fragment.
   */
-class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
+class StreamAddHeader[T <: Data](headerType: HardType[T], width: Int)
+    extends Component {
   val io = new Bundle {
     val inputStream = slave(Stream(Fragment(DataAndMty(width))))
-    val header = in(Bits(headerWidth bits))
-    val headerMty = in(Bits((headerWidth / BYTE_WIDTH) bits))
-    val outputStream = master(Stream(Fragment(DataAndMty(width))))
+    val inputHeader = slave(Stream(HeaderDataAndMty(headerType, width)))
+    val outputStream = master(
+      Stream(Fragment(HeaderDataAndMty(headerType, width)))
+    )
   }
 
-  val inputValid = io.inputStream.valid
-  val inputData = io.inputStream.data
-  val inputMty = io.inputStream.mty
-  val isFirstFrag = io.inputStream.isFirst
-  val isLastFrag = io.inputStream.isLast
+  val joinStream = FragmentStreamJoinStream(io.inputStream, io.inputHeader)
+
+  val inputValid = joinStream.valid
+  val inputData = joinStream._1.data
+  val inputMty = joinStream._1.mty
+  val inputHeader = joinStream._2.header
+  val inputHeaderData = joinStream._2.data
+  val inputHeaderMty = joinStream._2.mty
+  val isFirstFrag = joinStream.isFirst
+  val isLastFrag = joinStream.isLast
 
   val inputWidth = widthOf(inputData)
   val inputMtyWidth = widthOf(inputMty)
@@ -141,19 +252,30 @@ class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
     inputWidthBytes == inputMtyWidth,
     s"inputWidthBytes=${inputWidthBytes} should == inputMtyWidth=${inputMtyWidth}"
   )
-
-  val headerLenBytes = widthOf(io.header) / BYTE_WIDTH
-  val headerMtyWidth = widthOf(io.headerMty)
   require(
-    headerLenBytes == headerMtyWidth,
-    s"headerLenBytes=${headerLenBytes} should == headerMtyWidth=${headerMtyWidth}"
-  )
-  require(
-    headerLenBytes <= inputWidthBytes,
-    s"headerLenBytes=${headerLenBytes} should <= inputWidthBytes=${inputWidthBytes}"
+    width % BYTE_WIDTH == 0,
+    s"bus width=${width} must be multiple of byte length=${BYTE_WIDTH}"
   )
 
+  val headerMtyWidthUInt = CountOne(inputHeaderMty)
+  val headerMtyComp = setAllBits(headerMtyWidthUInt)
   when(inputValid) {
+    assert(
+      assertion = inputHeaderMty === headerMtyComp.resize(inputMtyWidth),
+      message =
+        L"invalid inputHeaderMty=${inputHeaderMty} with headerMtyWidth=${headerMtyWidthUInt}, should be ${headerMtyComp}",
+      severity = FAILURE
+    )
+    when(inputHeaderMty.orR) {
+      assert(
+        // OHMasking.first() return an OH indicate the right most 1 bit.
+        assertion = OHMasking.first(inputHeaderMty) === 1,
+        message =
+          L"the inputHeaderMty=${inputHeaderMty} should have consecutive valid bits from LSB side",
+        severity = FAILURE
+      )
+    }
+
     when(!isLastFrag) {
       assert(
         assertion = inputMty.andR,
@@ -169,18 +291,11 @@ class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
       )
     }
   }
-  when(io.headerMty.orR) {
-    assert(
-      assertion = OHMasking.first(io.headerMty) === 1,
-      message =
-        L"the headerMty should have consecutive valid bits from LSB side, but MTY=${inputMty}",
-      severity = FAILURE
-    )
-  }
 
   val cacheValidReg = RegInit(False)
   val cachedDataReg = Reg(Bits(inputWidth bits))
   val cachedMtyReg = Reg(Bits(inputMtyWidth bits))
+  val cachedHeaderReg = Reg(joinStream._2.headerType())
 
   val isOutputStreamLastResidue = RegInit(False)
   // If inputWidth is 32 bits, headerMty is 4'b0011,
@@ -188,37 +303,81 @@ class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
   // There is no bytes remaining to output.
   // If the inputMty of the last fragment is 4'b1110, then after the last input fragment,
   // THere is one extra byte remaining to output.
-  val lastFragHasResidue = (inputMty & io.headerMty.resize(inputMtyWidth)).orR
+  val lastFragHasResidue = (inputMty & inputHeaderMty).orR
 
-  val rightShiftBitAmt = inputWidth - headerWidth
-  val rightShiftByteAmt = inputMtyWidth - headerMtyWidth
   val outputData = Bits(inputWidth bits)
   val outputMty = Bits(inputWidthBytes bits)
-  when(isFirstFrag) { // isFirstFrag is true, concatenate header and inputData
-    outputData := (io.header ## inputData).resizeLeft(inputWidth)
-    outputMty := (io.headerMty ## inputMty).resizeLeft(inputMtyWidth)
-  } otherwise {
-    outputData := (cachedDataReg(0, headerWidth bits) ## inputData)
-      .resizeLeft(inputWidth)
-    outputMty := (cachedMtyReg(0, headerMtyWidth bits) ## inputMty)
-      .resizeLeft(inputMtyWidth)
+  val extraLastFragData = Bits(inputWidth bits)
+  val extraLastFragMty = Bits(inputWidthBytes bits)
+  switch(headerMtyWidthUInt) {
+    // Header length in bytes:
+    // BTH 12, RETH 16, AtomicETH 28, AETH 4, AtomicAckETH 8, ImmDt 4, IETH 4.
+    //
+    // Send request headers: BTH, BTH + ImmDt, BTH + IETH, 12 or 16 bytes
+    // Write request headers: BTH + RETH, BTH, BTH + ImmDt, BTH + RETH + ImmDt, 28 or 12 or 16 or 32 bytes
+    // Send/write Ack: BTH + AETH, 16 bytes
+    //
+    // Read request header: BTH + RETH, 28 bytes
+    // Read response header: BTH + AETH, BTH, 16 or 12 bytes
+    //
+    // Atomic request header: BTH + AtomicETH, 40 bytes
+    // Atomic response header: BTH + AETH + AtomicAckETH, 24 bytes
+    //
+    // Headers have length of multiple of 4 bytes
+    //
+    // TODO: remove unused header MTY width
+    for (headerMtyWidth <- 1 until inputWidthBytes) {
+      // for (headerMtyWidth <- widthOf(BTH()) until inputWidthBytes by 4) {
+      is(headerMtyWidth) {
+        val headerWidth = headerMtyWidth * BYTE_WIDTH
+
+        // TODO: check header valid bits are right-hand sided
+        when(isFirstFrag) { // isFirstFrag is true, concatenate header and inputData
+          outputData := (inputHeaderData(0, headerWidth bits) ## inputData)
+            .resizeLeft(inputWidth)
+          outputMty := (inputHeaderMty(0, headerMtyWidth bits) ## inputMty)
+            .resizeLeft(inputMtyWidth)
+        } otherwise {
+          outputData := (cachedDataReg(0, headerWidth bits) ## inputData)
+            .resizeLeft(inputWidth)
+          outputMty := (cachedMtyReg(0, headerMtyWidth bits) ## inputMty)
+            .resizeLeft(inputMtyWidth)
+        }
+
+        // The extra last fragment
+        extraLastFragData := (cachedDataReg(0, headerWidth bits) ##
+          B(0, inputWidth bits)).resizeLeft(inputWidth)
+        // When output stream has residue, the last beat is only from cachedDataReg, not from inputData
+        extraLastFragMty := (cachedMtyReg(0, headerMtyWidth bits) ##
+          B(0, inputMtyWidth bits)).resizeLeft(inputMtyWidth)
+      }
+    }
+    default {
+      outputData := 0
+      outputMty := 0
+      extraLastFragData := 0
+      extraLastFragMty := 0
+      assert(
+        assertion = False,
+        message =
+          L"invalid inputHeaderMty=${inputHeaderMty} with MTY width=${headerMtyWidthUInt} and inputHeaderData=${inputHeaderData}",
+        severity = FAILURE
+      )
+    }
   }
-  val inputStreamTranslate = io.inputStream.translateWith {
-    val rslt = cloneOf(io.inputStream.payload)
+
+  val inputStreamTranslate = joinStream.translateWith {
+    val rslt = cloneOf(io.outputStream.payloadType)
+    rslt.header := inputHeader
     rslt.data := outputData
     rslt.mty := outputMty
     rslt.last := isLastFrag && !lastFragHasResidue
     rslt
   }
 
-  // The extra last fragment
-  val extraLastFragData = (cachedDataReg(0, headerWidth bits) ##
-    B(0, inputWidth bits)).resizeLeft(inputWidth)
-  // When output stream has residue, the last beat is only from cachedDataReg, not from inputData
-  val extraLastFragMty = (cachedMtyReg(0, headerMtyWidth bits) ##
-    B(0, inputMtyWidth bits)).resizeLeft(inputMtyWidth)
-  val extraLastFragStream = cloneOf(io.inputStream)
+  val extraLastFragStream = cloneOf(io.outputStream)
   extraLastFragStream.valid := isOutputStreamLastResidue
+  extraLastFragStream.header := cachedHeaderReg
   extraLastFragStream.data := extraLastFragData
   extraLastFragStream.mty := extraLastFragMty
   extraLastFragStream.last := True
@@ -235,6 +394,7 @@ class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
   when(outputStream.fire) {
     cachedDataReg := inputData
     cachedMtyReg := inputMty
+    cachedHeaderReg := inputHeader
 
     when(isLastFrag) {
       when(lastFragHasResidue) { // Input stream ends but output stream has one more beat
@@ -242,27 +402,24 @@ class StreamAddHeader(width: Int, headerWidth: Int) extends Component {
         isOutputStreamLastResidue := True
       } otherwise { // Both input and output stream end
         cacheValidReg := False
-        // outputStream.last := True
       }
     } otherwise {
       cacheValidReg := True
     }
   }
 
-  io.outputStream <-/< outputStream
+  io.outputStream << outputStream
 }
 
 object StreamAddHeader {
-  def apply(
+  def apply[T <: Data](
       inputStream: Stream[Fragment[DataAndMty]],
-      header: Bits,
-      headerMty: Bits
-  ): Stream[Fragment[DataAndMty]] = {
+      inputHeader: Stream[HeaderDataAndMty[T]]
+  ): Stream[Fragment[HeaderDataAndMty[T]]] = {
     val rslt =
-      new StreamAddHeader(widthOf(inputStream.data), widthOf(header))
+      new StreamAddHeader(inputHeader.headerType, widthOf(inputStream.data))
     rslt.io.inputStream << inputStream
-    rslt.io.header := header
-    rslt.io.headerMty := headerMty
+    rslt.io.inputHeader << inputHeader
     rslt.io.outputStream
   }
 }
@@ -386,7 +543,7 @@ class StreamRemoveHeader(width: Int) extends Component {
     }
   }
 
-  io.outputStream <-/< outputStream
+  io.outputStream << outputStream
 }
 
 object StreamRemoveHeader {

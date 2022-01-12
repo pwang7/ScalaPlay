@@ -1402,11 +1402,19 @@ sealed abstract class RdmaBasePacket extends Bundle {
   // this: Bundle => // RdmaDataPacket must be of Bundle class
   val bth = BTH()
   // val eth = Bits(ETH_WIDTH bits)
-
 }
 
 case class DataAndMty(width: Int) extends Bundle {
   require(isPow2(width), s"width=${width} should be power of 2")
+  val data = Bits(width bits)
+  val mty = Bits((width / BYTE_WIDTH) bits)
+}
+
+case class HeaderDataAndMty[T <: Data](headerType: HardType[T], width: Int)
+    extends Bundle {
+//  type DataAndMty = HeaderDataAndMty[NoData]
+
+  val header = headerType()
   val data = Bits(width bits)
   val mty = Bits((width / BYTE_WIDTH) bits)
 }

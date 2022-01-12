@@ -3,6 +3,7 @@ package rdma
 import spinal.core.sim._
 import org.scalatest.funsuite.AnyFunSuite
 import ConstantSettings._
+import SimUtils._
 
 class StreamSegmentTest extends AnyFunSuite {
   val simCfg = SimConfig.allOptimisation.withWave
@@ -29,7 +30,10 @@ class StreamSegmentTest extends AnyFunSuite {
       }
       fork {
         for (idx <- 1 to 100) {
-          dut.io.outputStream.ready #= true // ((idx % 2) == 0)
+          randomizeSignalAndWaitUntilTrue(
+            dut.io.outputStream.ready,
+            dut.clockDomain
+          )
           dut.clockDomain.waitSamplingWhere(
             dut.io.outputStream.valid.toBoolean && dut.io.outputStream.ready.toBoolean
           )
@@ -63,8 +67,15 @@ class StreamAddHeaderTest extends AnyFunSuite {
     } else 0
     val fragmentNum = 10
 
-    dut.io.header #= setAllBits(headerWidth)
-    dut.io.headerMty #= setAllBits(headerWidth / BYTE_WIDTH)
+    // TODO: input varying headers
+    dut.io.inputHeader.valid #= true
+    dut.io.inputHeader.data #= setAllBits(headerWidth)
+    dut.io.inputHeader.mty #= setAllBits(headerWidth / BYTE_WIDTH)
+//    println(f"""dut.io.inputHeader.data #= ${setAllBits(headerWidth)}%X
+//         |dut.io.inputHeader.mty #= ${setAllBits(headerWidth / BYTE_WIDTH)}%X
+//         |CountOne(dut.io.inputHeader.mty) #= ${dut.countMtyOne.toInt}
+//         |""".stripMargin)
+
     dut.io.inputStream.valid #= false
     dut.io.outputStream.ready #= false
     dut.clockDomain.waitSampling(3)
@@ -133,8 +144,12 @@ class StreamAddHeaderTest extends AnyFunSuite {
     simSuccess()
   }
 
-  val simCfg = SimConfig.withWave
-    .compile(new StreamAddHeaderWrapper(width, headerWidth))
+  val simCfg = SimConfig.withWave.compile(new StreamAddHeaderWrapper(width))
+//    .compile {
+//      val dut = new StreamAddHeaderWrapper(width)
+//      dut.countMtyOne.simPublic()
+//      dut
+//    }
 
   test("StreamAddHeader test extra last fragment") {
     val lastFragMtyValidWidth = widthBytes - headerWidthBytes + 1
@@ -245,3 +260,191 @@ class StreamRemoveHeaderTest extends AnyFunSuite {
     simCfg.doSim(dut => testFunc(dut, lastFragMtyValidWidth))
   }
 }
+
+class FragmentStreamJoinStreamTest extends AnyFunSuite {
+  val width = 16
+
+  val simCfg = SimConfig.allOptimisation.withWave
+    .compile(new FragmentStreamJoinStreamWrapper(width))
+
+  test("FragmentStreamJoinStream test") {
+    simCfg.doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+
+      val fragNum = 10
+
+      dut.io.inputFragmentStream.valid #= false
+      dut.io.inputStream.valid #= false
+      dut.io.outputJoinStream.ready #= false
+      dut.clockDomain.waitSampling(3)
+
+      fork {
+        for (idx <- 1 to 100) {
+          randomizeSignalAndWaitUntilTrue(
+            dut.io.inputFragmentStream.valid,
+            dut.clockDomain
+          )
+          dut.io.inputFragmentStream.fragment #= idx
+          dut.io.inputFragmentStream.last #= (idx % fragNum == 0)
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.inputFragmentStream.valid.toBoolean && dut.io.inputFragmentStream.ready.toBoolean
+          )
+        }
+      }
+
+      fork {
+        for (idx <- 1 to 10) {
+          randomizeSignalAndWaitUntilTrue(
+            dut.io.inputStream.valid,
+            dut.clockDomain
+          )
+          dut.io.inputStream.payload #= (idx << (width / 2))
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.inputStream.valid.toBoolean && dut.io.inputStream.ready.toBoolean
+          )
+        }
+      }
+
+      fork {
+        for (idx <- 1 to 100) {
+          randomizeSignalAndWaitUntilTrue(
+            dut.io.outputJoinStream.ready,
+            dut.clockDomain
+          )
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.outputJoinStream.valid.toBoolean && dut.io.outputJoinStream.ready.toBoolean
+          )
+          val outputVal = dut.io.outputJoinStream.fragment.toInt
+          val outputValLowerHalf = outputVal & setAllBits(width / 2)
+          val outputValHigherHalf =
+            outputVal & (setAllBits(width / 2) << (width / 2))
+          println(f"""io.outputJoinStream.fragment=${outputVal}%X,
+                |  outputValLowerHalf=${outputValLowerHalf}%X,
+                |  outputValHigherHalf=${outputValHigherHalf}%X,
+                |  idx=${idx}=0x${idx}%X""".stripMargin)
+          assert(outputValLowerHalf == idx)
+          assert(
+            outputValHigherHalf == (((idx - 1) / fragNum) + 1) << (width / 2)
+          )
+        }
+      }
+      dut.clockDomain.waitSampling(100)
+      simSuccess()
+    }
+  }
+}
+
+class SignalEdgeDrivenStreamWrapperTest extends AnyFunSuite {
+  val width = 8
+
+  val simCfg = SimConfig.allOptimisation.withWave
+    .compile(new SignalEdgeDrivenStreamWrapper(width))
+
+  test("SignalEdgeDrivenStream test") {
+    simCfg.doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+
+      val fragNum = 10
+
+      dut.io.inputFragmentStream.valid #= false
+      dut.io.outputStream.ready #= false
+      dut.clockDomain.waitSampling(3)
+
+      fork {
+        for (idx <- 1 to 1000) {
+          randomizeSignalAndWaitUntilTrue(
+            dut.io.inputFragmentStream.valid,
+            dut.clockDomain
+          )
+          // dut.io.inputFragmentStream.valid #= true
+          dut.io.inputFragmentStream.fragment #= idx
+          dut.io.inputFragmentStream.last #= (idx % fragNum == 0)
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.inputFragmentStream.valid.toBoolean && dut.io.inputFragmentStream.ready.toBoolean
+          )
+        }
+      }
+
+      fork {
+        while (true) {
+          dut.clockDomain.waitSampling()
+          dut.io.outputStream.ready.randomize()
+//          if (dut.io.outputStream.valid.toBoolean) {
+//            dut.io.outputStream.ready.randomize()
+//          } else {
+//            dut.io.outputStream.ready #= false
+//          }
+//          randomizeSignalAndWaitUntilTrue(
+//            dut.io.outputStream.ready,
+//            dut.clockDomain
+//          )
+//          dut.clockDomain.waitSamplingWhere(
+//            dut.io.outputStream.valid.toBoolean && dut.io.outputStream.ready.toBoolean
+//          )
+        }
+      }
+      fork {
+        for (idx <- 0 to 100) {
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.outputStream.valid.toBoolean && dut.io.outputStream.ready.toBoolean
+          )
+          println(
+            f"io.outputStream.payload=${dut.io.outputStream.payload.toInt} @ idx=${idx}"
+          )
+          assert(dut.io.outputStream.payload.toInt == (idx * fragNum + 1))
+        }
+      }
+
+      dut.clockDomain.waitSampling(300)
+      simSuccess()
+    }
+  }
+}
+
+/*
+class MergeDemuxStreamsTest extends AnyFunSuite {
+  val width = 32
+
+  val simCfg = SimConfig.allOptimisation.withWave
+    .compile(new MergeDemuxStreamsWrapper(width))
+
+  test("MergeDemuxStreams test") {
+    simCfg.doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+
+      val widthBytes = width / BYTE_WIDTH
+
+      dut.io.fragmentNum #= 5
+      dut.io.inputStream.valid #= false
+      dut.io.outputStream.ready #= false
+      dut.clockDomain.waitSampling(3)
+
+      fork {
+        for (idx <- 1 to 100) {
+          dut.io.inputStream.valid #= true
+          dut.io.inputStream.data #= idx
+          dut.io.inputStream.mty #= setAllBits(widthBytes)
+          dut.io.inputStream.last #= false
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.inputStream.valid.toBoolean && dut.io.inputStream.ready.toBoolean
+          )
+        }
+      }
+      fork {
+        for (idx <- 1 to 100) {
+          dut.io.outputStream.ready #= true
+          dut.clockDomain.waitSamplingWhere(
+            dut.io.outputStream.valid.toBoolean && dut.io.outputStream.ready.toBoolean
+          )
+          println(
+            f"io.outputStream.data=${dut.io.outputStream.data.toLong}%X == idx=${idx}"
+          )
+          // assert(dut.io.outputStream.data.toLong == idx)
+        }
+      }
+      dut.clockDomain.waitSampling(100)
+      simSuccess()
+    }
+  }
+}
+ */

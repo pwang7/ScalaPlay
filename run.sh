@@ -21,6 +21,8 @@ fi
 ./mill play.test.testOnly rdma.StreamAddHeaderTest
 ./mill play.test.testOnly rdma.StreamRemoveHeaderTest
 ./mill play.test.testOnly rdma.StreamSegmentTest
+./mill play.test.testOnly rdma.FragmentStreamJoinStreamTest
+./mill play.test.testOnly rdma.SignalEdgeDrivenStreamWrapperTest
 
 # Check format and lint
 if [ "$CI_ENV" = "true" ]; then
