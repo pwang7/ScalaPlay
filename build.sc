@@ -1,15 +1,18 @@
-import $ivy.`com.goyeau::mill-scalafix:0.2.5`
+// https://repo1.maven.org/maven2/com/goyeau/mill-scalafix_mill0.10_2.13/
+import $ivy.`com.goyeau::mill-scalafix_mill0.10:0.2.10`
 import com.goyeau.mill.scalafix.ScalafixModule
-import mill._, scalalib._, scalafmt._
+import mill._, mill.scalalib._, scalafmt._
 // import mill.scalalib.bsp.ScalaMetalsSupport
 
-val spinalVersion = "1.6.1"
-val scalaTestVersion = "3.2.10"
-val vexRiscvVersion = "2.0.0"
+val spinalVersion = "1.7.3"
+val scalaTestVersion = "3.2.13"
+val scalafixVersion = "0.10.1"
+val semanticDbVersion = "4.5.12"
+//val vexRiscvVersion = "2.0.0"
 
 trait CommonSpinalModule extends ScalaModule with ScalafmtModule with ScalafixModule { // with ScalaMetalsSupport {
-  def scalaVersion = "2.13.6"
-  // def semanticDbVersion = "4.4.31"
+  def scalaVersion = "2.13.8"
+
   override def scalacOptions = Seq(
     //"-V", // Print a synopsis of verbose options.
     //"-W", // Print a synopsis of warning options.
@@ -85,8 +88,11 @@ trait CommonSpinalModule extends ScalaModule with ScalafmtModule with ScalafixMo
   override def ivyDeps = Agg(
     ivy"com.github.spinalhdl::spinalhdl-core:$spinalVersion",
     ivy"com.github.spinalhdl::spinalhdl-lib:$spinalVersion",
-    ivy"com.github.spinalhdl::spinalhdl-sim:$spinalVersion"
+    ivy"com.github.spinalhdl::spinalhdl-sim:$spinalVersion",
+    ivy"ch.epfl.scala:scalafix-interfaces:$scalafixVersion",
+//    ivy"org.scalameta:::semanticdb-scalac:$semanticDbVersion"
   )
+  override def scalafixIvyDeps = Agg(ivy"com.github.liancheng::organize-imports:0.6.0")
 
   override def scalacPluginIvyDeps = Agg(ivy"com.github.spinalhdl::spinalhdl-idsl-plugin:$spinalVersion")
   // override def scalafixIvyDeps = Agg(
@@ -105,8 +111,8 @@ object play extends CommonSpinalModule {
     override def ivyDeps = Agg(ivy"org.scalatest::scalatest:$scalaTestVersion")
 
     override def testFramework = "org.scalatest.tools.Framework"
-    def testOnly(args: String*) = T.command {
-      super.runMain("org.scalatest.run", args: _*)
-    }
+//    def testSim(args: String*) = T.command {
+//      super.runMain("org.scalatest.run", args: _*)
+//    }
   }
 }

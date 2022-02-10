@@ -4,7 +4,7 @@ import spinal.core._
 // import spinal.lib._
 
 //import BusWidth.BusWidth
-import ConstantSettings._
+//import ConstantSettings._
 import RdmaConstants._
 
 //----------RDMA defined headers----------//
@@ -24,7 +24,7 @@ case class BTH() extends RdmaHeader {
   val opcodeFull = Bits(TRANSPORT_WIDTH + OPCODE_WIDTH bits)
   val solicited = Bool()
   val migreq = Bool()
-  val padcount = UInt(PADCOUNT_WIDTH bits)
+  val padCnt = UInt(PAD_COUNT_WIDTH bits)
   val version = Bits(VERSION_WIDTH bits)
   val pkey = Bits(PKEY_WIDTH bits)
   val fecn = Bool()
@@ -39,14 +39,14 @@ case class BTH() extends RdmaHeader {
   def opcode = opcodeFull(0, OPCODE_WIDTH bits)
 
   def set(opcode: Bits, dqpn: UInt, psn: UInt): this.type = {
-    val padCnt = U(0, PADCOUNT_WIDTH bits)
-    set(opcode = opcode, padcount = padCnt, dqpn = dqpn, psn = psn)
+    val padCnt = U(0, PAD_COUNT_WIDTH bits)
+    set(opcode = opcode, padCnt = padCnt, dqpn = dqpn, psn = psn)
   }
 
-  def set(opcode: Bits, padcount: UInt, dqpn: UInt, psn: UInt): this.type = {
+  def set(opcode: Bits, padCnt: UInt, dqpn: UInt, psn: UInt): this.type = {
     set(
       opcode = opcode,
-      padcount = padcount,
+      padCnt = padCnt,
       dqpn = dqpn,
       ackReq = False,
       psn = psn
@@ -55,7 +55,7 @@ case class BTH() extends RdmaHeader {
 
   def set(
       opcode: Bits,
-      padcount: UInt,
+      padCnt: UInt,
       dqpn: UInt,
       ackReq: Bool,
       psn: UInt
@@ -64,7 +64,7 @@ case class BTH() extends RdmaHeader {
     this.opcode := opcode
     solicited := False
     migreq := False
-    this.padcount := padcount
+    this.padCnt := padCnt
     version := 0
     pkey := 0xffff // Default PKEY
     fecn := False
@@ -83,7 +83,7 @@ case class BTH() extends RdmaHeader {
     opcode := 0
     solicited := False
     migreq := False
-    padcount := 0
+    padCnt := 0
     version := 0
     pkey := 0xffff // Default PKEY
     fecn := False
@@ -104,7 +104,31 @@ case class AETH() extends RdmaHeader {
   val value = Bits(AETH_VALUE_WIDTH bits)
   val msn = UInt(MSN_WIDTH bits)
 
-  def set(ackType: AckType.AckType): this.type = {
+  def toWorkCompStatus(): SpinalEnumCraft[WorkCompStatus.type] =
+    new Composite(this) {
+      val workCompStatus = WorkCompStatus() // Bits(WC_STATUS_WIDTH bits)
+      when(isNormalAck()) {
+        workCompStatus := WorkCompStatus.SUCCESS
+      } elsewhen (isInvReqNak()) {
+        workCompStatus := WorkCompStatus.REM_INV_REQ_ERR
+      } elsewhen (isRmtAccNak()) {
+        workCompStatus := WorkCompStatus.REM_ACCESS_ERR
+      } elsewhen (isRmtOpNak()) {
+        workCompStatus := WorkCompStatus.REM_OP_ERR
+      } elsewhen (isSeqNak()) {
+        workCompStatus := WorkCompStatus.RETRY_EXC_ERR
+      } elsewhen (isRnrNak()) {
+        workCompStatus := WorkCompStatus.RNR_RETRY_EXC_ERR
+      } otherwise {
+        report(
+          message =
+            L"${REPORT_TIME} time: illegal AETH to WC state, code=${code}, value=${value}".toSeq
+        )
+        workCompStatus := WorkCompStatus.FATAL_ERR
+      }
+    }.workCompStatus
+
+  def set(ackType: SpinalEnumCraft[AckType.type]): this.type = {
     require(
       ackType != AckType.NAK_RNR,
       "RNR NAK type requires rnrTimeOut as input"
@@ -116,23 +140,30 @@ case class AETH() extends RdmaHeader {
   }
 
   def set(
-      ackType: AckType.AckType,
+      ackType: SpinalEnumCraft[AckType.type],
+      rnrTimeOut: Bits
+  ): this.type = {
+    set(ackType, msn = 0, creditCnt = 0, rnrTimeOut = rnrTimeOut)
+  }
+
+  def set(
+      ackType: SpinalEnumCraft[AckType.type],
       msn: Int,
       creditCnt: Int,
       rnrTimeOut: Bits
   ): this.type = {
-    val ackTypeBits = Bits(ACK_TYPE_WIDTH bits)
-    ackTypeBits := ackType.id
+//    val ackTypeBits = Bits(ACK_TYPE_WIDTH bits)
+//    ackTypeBits := ackType.id
     val msnBits = UInt(MSN_WIDTH bits)
     msnBits := msn
     val creditCntBits = Bits(AETH_VALUE_WIDTH bits)
     creditCntBits := creditCnt
 
-    setHelper(ackTypeBits, msnBits, creditCntBits, rnrTimeOut)
+    setHelper(ackType, msnBits, creditCntBits, rnrTimeOut)
   }
 
   def setHelper(
-      ackType: Bits,
+      ackType: SpinalEnumCraft[AckType.type],
       msn: UInt,
       creditCnt: Bits,
       rnrTimeOut: Bits
@@ -141,52 +172,89 @@ case class AETH() extends RdmaHeader {
     this.msn := msn
 
     switch(ackType) {
-      is(AckType.NORMAL.id) {
+      is(AckType.NORMAL) {
         code := AethCode.ACK.id
         value := creditCnt
       }
-      is(AckType.NAK_SEQ.id) {
+      is(AckType.NAK_SEQ) {
         code := AethCode.NAK.id
         value := NakCode.SEQ.id
       }
-      is(AckType.NAK_INV.id) {
+      is(AckType.NAK_INV) {
         code := AethCode.NAK.id
         value := NakCode.INV.id
       }
-      is(AckType.NAK_RMT_ACC.id) {
+      is(AckType.NAK_RMT_ACC) {
         code := AethCode.NAK.id
         value := NakCode.RMT_ACC.id
       }
-      is(AckType.NAK_RMT_OP.id) {
+      is(AckType.NAK_RMT_OP) {
         code := AethCode.NAK.id
         value := NakCode.RMT_OP.id
       }
-      is(AckType.NAK_RNR.id) {
+      is(AckType.NAK_RNR) {
         code := AethCode.RNR.id
         value := rnrTimeOut
       }
-      default {
-        code := AethCode.RSVD.id
-        value := 0
-        assert(
-          assertion = False,
-          message = L"invalid AckType=$ackType",
-          severity = FAILURE
-        )
-      }
+//      default {
+//        code := AethCode.RSVD.id
+//        value := 0
+//        report(
+//          message = L"${REPORT_TIME} time: invalid AckType=$ackType",
+//          severity = FAILURE
+//        )
+//      }
     }
     this
   }
 
-  def isRetryAck(): Bool =
+  def isNormalAck(): Bool =
     new Composite(this) {
-      val rslt = False
-      when(code === AethCode.RNR.id) {
-        rslt := True
-      } elsewhen (code === AethCode.NAK.id && value === NakCode.SEQ.id) {
-        rslt := True
-      }
-    }.rslt
+      val result = code === AethCode.ACK.id
+    }.result
+
+  def isRetryNak(): Bool =
+    new Composite(this) {
+      val result =
+        code === AethCode.RNR.id || (code === AethCode.NAK.id && value === NakCode.SEQ.id)
+    }.result
+
+  def isRnrNak(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.RNR.id
+    }.result
+
+  def isSeqNak(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.NAK.id && value === NakCode.SEQ.id
+    }.result
+
+  def isErrAck(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.NAK.id && value =/= NakCode.SEQ.id &&
+        !NakCode.isReserved(value)
+    }.result
+
+  def isInvReqNak(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.NAK.id && value === NakCode.INV.id
+    }.result
+
+  def isRmtAccNak(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.NAK.id && value === NakCode.RMT_ACC.id
+    }.result
+
+  def isRmtOpNak(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.NAK.id && value === NakCode.RMT_OP.id
+    }.result
+
+  def isReserved(): Bool =
+    new Composite(this) {
+      val result = code === AethCode.RSVD.id ||
+        (code === AethCode.NAK.id && NakCode.isReserved(value))
+    }.result
 
   // TODO: remove this
   def setDefaultVal(): this.type = {
